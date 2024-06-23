@@ -24,6 +24,16 @@ static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 use heapless::{LinearMap, Vec};
 use {defmt_rtt as _, panic_probe as _}; // Adjust the import path according to your setup
 
+const ONE_MILL: Duration = Duration::from_millis(1);
+
+enum State {
+    Push,
+    RandomWait,
+    Tilt,
+    Count,
+    ShowScore,
+}
+
 #[embassy_executor::main]
 async fn main(_spawner0: Spawner) {
     let (pins, core1) = Pins::new_and_core1();
@@ -40,50 +50,73 @@ async fn main(_spawner0: Spawner) {
         },
     );
 
-    let one_mill = Duration::from_millis(1);
+    let button: &mut gpio::Input<'_> = pins.button;
+    let led0: &mut gpio::Output<'_> = pins.led0;
 
-    // main loop
-    loop {
-        // turn on the led and display 'PUSH'
-        pins.led0.set_high();
-        let randomish = Duration::from_millis((Instant::now().as_ticks() % 3000) + 500);
+    async fn push_state(led0: &mut gpio::Output<'_>, button: &mut gpio::Input<'_>) -> State {
+        led0.set_high();
         VIRTUAL_DISPLAY1.write_text("PUSH").await;
 
         // wait for the button to be pressed down and released
-        pins.button.wait_for_rising_edge().await;
-        pins.button.wait_for_falling_edge().await;
-        pins.led0.set_low();
+        button.wait_for_rising_edge().await;
+        button.wait_for_falling_edge().await;
+        State::RandomWait
+    }
+
+    async fn random_wait_state(led0: &mut gpio::Output<'_>, button: &mut gpio::Input<'_>) -> State {
+        let randomish = Duration::from_millis((Instant::now().as_ticks() % 3000) + 500);
+        led0.set_low();
         VIRTUAL_DISPLAY1.write_text("----").await;
 
-        // sleep for 2 seconds (if a cheater pushes the button, start over)
+        // sleep for random-ish seconds (if a cheater pushes the button, start over)
         if let Either::First(()) =
-            select(pins.button.wait_for_rising_edge(), Timer::after(randomish)).await
+            select(button.wait_for_rising_edge(), Timer::after(randomish)).await
         {
-            VIRTUAL_DISPLAY1.write_text("TILT").await;
-            pins.button.wait_for_rising_edge().await;
-            pins.button.wait_for_falling_edge().await;
-            continue;
+            State::Tilt
+        } else {
+            State::Count
         }
+    }
 
-        // turn on the led and start counting while waiting for a button down
+    async fn tilt_state(_led0: &mut gpio::Output<'_>, button: &mut gpio::Input<'_>) -> State {
+        VIRTUAL_DISPLAY1.write_text("TILT").await;
+        button.wait_for_rising_edge().await;
+        button.wait_for_falling_edge().await;
+        State::Push
+    }
+
+    async fn count_state(led0: &mut gpio::Output<'_>, button: &mut gpio::Input<'_>) -> State {
         VIRTUAL_DISPLAY1.write_number(0, /*padding*/ 0).await;
-        pins.led0.set_high();
+        led0.set_high();
         let start = Instant::now();
         loop {
             // if button is down leave loop
-            if pins.button.is_high() {
-                break;
+            if button.is_high() {
+                return State::ShowScore;
             }
-            Timer::after(one_mill).await;
+            Timer::after(ONE_MILL).await;
             // milliseconds since start
             let elapsed = min((Instant::now() - start).as_millis(), 9999) as u16;
             VIRTUAL_DISPLAY1.write_number(elapsed, 0).await;
         }
+    }
 
-        // Show score until they press the button again
-        pins.led0.set_low();
-        pins.button.wait_for_falling_edge().await;
-        pins.button.wait_for_rising_edge().await;
+    async fn show_score_state(led0: &mut gpio::Output<'_>, button: &mut gpio::Input<'_>) -> State {
+        led0.set_low();
+        button.wait_for_falling_edge().await;
+        button.wait_for_rising_edge().await;
+        State::Push
+    }
+
+    let mut state = State::Push;
+    loop {
+        state = match state {
+            State::Push => push_state(led0, button).await,
+            State::RandomWait => random_wait_state(led0, button).await,
+            State::Tilt => tilt_state(led0, button).await,
+            State::Count => count_state(led0, button).await,
+            State::ShowScore => show_score_state(led0, button).await,
+        };
     }
 }
 
